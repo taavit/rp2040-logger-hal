@@ -6,14 +6,14 @@
 
 mod sensor;
 
-use arrayvec::ArrayString;
+use arrayvec::{ArrayString, ArrayVec};
 use bsp::hal::timer::Alarm;
 use bsp::hal::uart::UartPeripheral;
 use bsp::hal::Timer;
 use cortex_m::asm;
 use cortex_m::delay::Delay;
 use critical_section::Mutex;
-use embedded_sdmmc::{File, SdCard, TimeSource, Timestamp, VolumeManager};
+use embedded_sdmmc::{File, SdCard, TimeSource, Timestamp, Volume, VolumeManager};
 use sensor::lsm303d::lsm303d::LSM303D;
 use sensor::lsm303d::{configuration::*, lsm303d::Measurements};
 
@@ -50,6 +50,15 @@ enum State {
     Recording,
 }
 
+impl State {
+    pub fn toggle(&mut self) {
+        *self = match *self {
+            Self::Idle => Self::Recording,
+            Self::Recording => Self::Idle,
+        };
+    }
+}
+
 struct IrqDelayer {}
 
 impl DelayUs<u8> for IrqDelayer {
@@ -78,16 +87,97 @@ impl DelayMs<u32> for IrqDelayer {
     }
 }
 
-struct SdWriter {
-    pub file: File,
-    pub volume_mgr: VolumeManager<
-        SdCard<
-            bsp::hal::Spi<bsp::hal::spi::Enabled, bsp::pac::SPI1, 8>,
-            gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
-            IrqDelayer,
-        >,
-        DummyTimesource,
+type VolumeManagerType = VolumeManager<
+    SdCard<
+        bsp::hal::Spi<bsp::hal::spi::Enabled, bsp::pac::SPI1, 8>,
+        gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
+        IrqDelayer,
     >,
+    DummyTimesource,
+>;
+struct SdWriter {
+    file: Option<File>,
+    volume_mgr: VolumeManagerType,
+    volume: Volume,
+    file_idx: u16,
+    base_filename: ArrayString<16>,
+    filename: ArrayString<32>,
+}
+
+impl SdWriter {
+    pub fn new(file: &str, mut volume_mgr: VolumeManagerType) -> Self {
+        let mut volume = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
+        Self {
+            volume,
+            volume_mgr,
+            file: None,
+            file_idx: 1,
+            base_filename: ArrayString::new(),
+            filename: ArrayString::new(),
+        }
+    }
+    pub fn write(&mut self, data: &str) {
+        critical_section::with(|cs| {
+            if let Some(ref mut file) = self.file {
+                let mut cache = CACHE.borrow(cs).borrow_mut();
+                cache.push(ArrayString::from(data).unwrap());
+                if cache.is_full() {
+                    let mut full_string = ArrayString::<640>::new();
+                    for e in cache.drain(..) {
+                        full_string.push_str(e.as_str());
+                    }
+                    self.volume_mgr
+                        .write(&mut self.volume, file, full_string.as_bytes())
+                        .unwrap();
+                }
+            }
+        });
+    }
+
+    pub fn start_recording(&mut self) {
+        self.generate_filename();
+        critical_section::with(|cs| {
+            CACHE.borrow(cs).borrow_mut().clear();
+            let root_dir = self.volume_mgr.open_root_dir(&self.volume).unwrap();
+            let csv_file = self
+                .volume_mgr
+                .open_file_in_dir(
+                    &mut self.volume,
+                    &root_dir,
+                    &self.filename.as_str(),
+                    embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
+                )
+                .unwrap();
+            self.file = Some(csv_file);
+        });
+    }
+
+    pub fn stop_recording(&mut self) {
+        if let Some(mut file) = self.file.take() {
+            critical_section::with(|cs| {
+                let mut cache = CACHE.borrow(cs).borrow_mut();
+
+                let mut full_string = ArrayString::<640>::new();
+                for e in cache.drain(..) {
+                    full_string.push_str(e.as_str());
+                }
+                self.volume_mgr
+                    .write(&mut self.volume, &mut file, full_string.as_bytes())
+                    .unwrap();
+                self.volume_mgr.close_file(&self.volume, file).unwrap();
+            });
+            self.file_idx += 1;
+        }
+    }
+
+    fn generate_filename(&mut self) {
+        write!(
+            self.filename,
+            "{}_{:05}.csv",
+            self.base_filename, self.file_idx
+        )
+        .unwrap();
+    }
 }
 
 #[derive(Default)]
@@ -140,6 +230,8 @@ static SENSOR: Mutex<RefCell<Option<LSM303D<I2CPin>>>> = Mutex::new(RefCell::new
 static SDWRITER: Mutex<RefCell<Option<SdWriter>>> = Mutex::new(RefCell::new(None));
 static DELAYER: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
 static LED_SET: Mutex<RefCell<Option<LedSet>>> = Mutex::new(RefCell::new(None));
+static CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 10>>> =
+    Mutex::new(RefCell::new(ArrayVec::new_const()));
 
 #[entry]
 fn main() -> ! {
@@ -217,9 +309,9 @@ fn main() -> ! {
         )
         .unwrap();
 
-    let mut control_led = pins.led.into_push_pull_output();
-    let mut idle_led = pins.gpio16.into_push_pull_output();
-    let mut recording_led = pins.gpio17.into_push_pull_output();
+    let control_led = pins.led.into_push_pull_output();
+    let idle_led = pins.gpio16.into_push_pull_output();
+    let recording_led = pins.gpio17.into_push_pull_output();
 
     let mut timer = bsp::hal::timer::Timer::new(pac.TIMER, &mut pac.RESETS);
 
@@ -258,7 +350,7 @@ fn main() -> ! {
         IrqDelayer,
     > = embedded_sdmmc::SdCard::new(spi, spi_cs, IrqDelayer {});
 
-    let mut volume_mgr: VolumeManager<
+    let volume_mgr: VolumeManager<
         SdCard<
             bsp::hal::Spi<bsp::hal::spi::Enabled, pac::SPI1, 8>,
             gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
@@ -285,23 +377,10 @@ fn main() -> ! {
         )));
     });
 
-    let mut volume0 = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
-
-    let root_dir = volume_mgr.open_root_dir(&volume0).unwrap();
-    let csv_file = volume_mgr
-        .open_file_in_dir(
-            &mut volume0,
-            &root_dir,
-            "a_2.csv",
-            embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
-        )
-        .unwrap();
-
     critical_section::with(|cs| {
-        SDWRITER.borrow(cs).replace(Some(SdWriter {
-            file: csv_file,
-            volume_mgr: volume_mgr,
-        }));
+        SDWRITER
+            .borrow(cs)
+            .replace(Some(SdWriter::new("data", volume_mgr)));
     });
 
     loop {
@@ -366,20 +445,8 @@ fn TIMER_IRQ_0() {
         let leds = leds.as_mut().unwrap();
         if current_state == State::Recording {
             let sd_writer_raw = &mut SDWRITER.borrow_ref_mut(cs);
-            let sd_writer = sd_writer_raw.as_mut().unwrap();
-            let mut volume0 = sd_writer
-                .volume_mgr
-                .get_volume(embedded_sdmmc::VolumeIdx(0))
-                .unwrap();
+            sd_writer_raw.as_mut().unwrap().write(buffer.as_str());
 
-            sd_writer
-                .volume_mgr
-                .write(
-                    &mut volume0,
-                    &mut sd_writer.file,
-                    buffer.as_str().as_bytes(),
-                )
-                .unwrap();
             leds.1.set_low().unwrap();
             if *leds.3.borrow() {
                 leds.2.set_high().unwrap();
@@ -430,10 +497,22 @@ fn IO_IRQ_BANK0() {
             }
 
             if button.interrupt_status(gpio::Interrupt::EdgeLow) {
-                *s = match *s {
-                    State::Idle => State::Recording,
-                    State::Recording => State::Idle,
-                };
+                s.toggle();
+                if *s == State::Idle {
+                    SDWRITER
+                        .borrow(cs)
+                        .borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .stop_recording();
+                } else {
+                    SDWRITER
+                        .borrow(cs)
+                        .borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .start_recording();
+                }
                 button.clear_interrupt(gpio::Interrupt::EdgeLow);
             }
         }
