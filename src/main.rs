@@ -13,7 +13,7 @@ use bsp::hal::Timer;
 use cortex_m::asm;
 use cortex_m::delay::Delay;
 use critical_section::Mutex;
-use embedded_sdmmc::{File, SdCard, TimeSource, Timestamp, Volume, VolumeManager};
+use embedded_sdmmc::{Directory, File, SdCard, TimeSource, Timestamp, Volume, VolumeManager};
 use sensor::lsm303d::lsm303d::LSM303D;
 use sensor::lsm303d::{configuration::*, lsm303d::Measurements};
 
@@ -28,10 +28,10 @@ use bsp::{
     },
 };
 
+use core::panic::PanicInfo;
 use core::{cell::RefCell, fmt::Write};
 use embedded_hal::digital::v2::OutputPin;
 use fugit::{MicrosDurationU32, MicrosDurationU64, RateExtU32};
-use {defmt_rtt as _, panic_probe as _};
 
 use rp_pico as bsp;
 
@@ -50,12 +50,20 @@ enum State {
     Recording,
 }
 
-impl State {
-    pub fn toggle(&mut self) {
-        *self = match *self {
+impl core::ops::Not for State {
+    type Output = Self;
+
+    fn not(self) -> Self {
+        match self {
             Self::Idle => Self::Recording,
             Self::Recording => Self::Idle,
-        };
+        }
+    }
+}
+
+impl State {
+    pub fn toggle(&mut self) {
+        *self = !*self;
     }
 }
 
@@ -99,6 +107,7 @@ struct SdWriter {
     file: Option<File>,
     volume_mgr: VolumeManagerType,
     volume: Volume,
+    root_dir: Directory,
     file_idx: u16,
     base_filename: ArrayString<16>,
     filename: ArrayString<32>,
@@ -106,14 +115,17 @@ struct SdWriter {
 
 impl SdWriter {
     pub fn new(file: &str, mut volume_mgr: VolumeManagerType) -> Self {
-        let mut volume = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
+        let volume = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
+        let root_dir = volume_mgr.open_root_dir(&volume).unwrap();
+        let filename = ArrayString::new();
         Self {
             volume,
             volume_mgr,
             file: None,
             file_idx: 1,
-            base_filename: ArrayString::new(),
-            filename: ArrayString::new(),
+            base_filename: ArrayString::from(file).unwrap(),
+            filename: filename,
+            root_dir,
         }
     }
     pub fn write(&mut self, data: &str) {
@@ -136,14 +148,14 @@ impl SdWriter {
 
     pub fn start_recording(&mut self) {
         self.generate_filename();
+
         critical_section::with(|cs| {
             CACHE.borrow(cs).borrow_mut().clear();
-            let root_dir = self.volume_mgr.open_root_dir(&self.volume).unwrap();
             let csv_file = self
                 .volume_mgr
                 .open_file_in_dir(
                     &mut self.volume,
-                    &root_dir,
+                    &self.root_dir,
                     &self.filename.as_str(),
                     embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
                 )
@@ -153,8 +165,8 @@ impl SdWriter {
     }
 
     pub fn stop_recording(&mut self) {
-        if let Some(mut file) = self.file.take() {
-            critical_section::with(|cs| {
+        critical_section::with(|cs| {
+            if let Some(mut file) = self.file.take() {
                 let mut cache = CACHE.borrow(cs).borrow_mut();
 
                 let mut full_string = ArrayString::<640>::new();
@@ -165,12 +177,13 @@ impl SdWriter {
                     .write(&mut self.volume, &mut file, full_string.as_bytes())
                     .unwrap();
                 self.volume_mgr.close_file(&self.volume, file).unwrap();
-            });
+            };
             self.file_idx += 1;
-        }
+        })
     }
 
     fn generate_filename(&mut self) {
+        self.filename.clear();
         write!(
             self.filename,
             "{}_{:05}.csv",
@@ -380,7 +393,7 @@ fn main() -> ! {
     critical_section::with(|cs| {
         SDWRITER
             .borrow(cs)
-            .replace(Some(SdWriter::new("data", volume_mgr)));
+            .replace(Some(SdWriter::new("d", volume_mgr)));
     });
 
     loop {
@@ -517,4 +530,24 @@ fn IO_IRQ_BANK0() {
             }
         }
     });
+}
+
+fn uart_write(a: &str) {
+    critical_section::with(|cs| {
+        UART.borrow(cs)
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .write_str(a)
+            .unwrap();
+    });
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    let mut a = ArrayString::<4096>::new();
+    writeln!(a, "{}", info).ok();
+    uart_write(a.as_str());
+
+    loop {}
 }
