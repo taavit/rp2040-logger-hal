@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AccelerationDataRate {
     PowerOff = 0b0000_0000,
@@ -14,6 +15,7 @@ pub enum AccelerationDataRate {
     Hz1600 = 0b1010_0000,
 }
 
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AccelerationFullScale {
@@ -24,6 +26,7 @@ pub enum AccelerationFullScale {
     Acc16G = 0b0010_0000,
 }
 
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum MagnetometerDataRate {
@@ -35,21 +38,25 @@ pub enum MagnetometerDataRate {
     Hz100 = 0b0001_0100,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum MagnetometerResolution {
     Low = 0b0000_0000,
     High = 0b0110_0000,
 }
 
+/// Magnetic field in Gauss
+#[allow(dead_code)]
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum MagnetometerFullScale {
-    Mag2Gauss = 0b0000_0000,
-    Mag4Gauss = 0b0010_0000,
-    Mag8Gauss = 0b0100_0000,
-    Mag12Gauss = 0b0110_0000,
+    Mag2 = 0b0000_0000,
+    Mag4 = 0b0010_0000,
+    Mag8 = 0b0100_0000,
+    Mag12 = 0b0110_0000,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum MagneticSensorMode {
     ContinuousConversion = 0b0000_0000,
@@ -98,7 +105,7 @@ impl Default for Configuration {
             magnetometer: MagnetometerConfiguration {
                 data_rate: MagnetometerDataRate::Hz25,
                 mode: MagneticSensorMode::PowerDown,
-                scale: MagnetometerFullScale::Mag2Gauss,
+                scale: MagnetometerFullScale::Mag2,
                 resolution: MagnetometerResolution::Low,
             },
             temperature: InternalTemperatureConfiguration { active: false },

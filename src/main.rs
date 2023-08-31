@@ -14,8 +14,8 @@ use cortex_m::asm;
 use cortex_m::delay::Delay;
 use critical_section::Mutex;
 use embedded_sdmmc::{Directory, File, SdCard, TimeSource, Timestamp, Volume, VolumeManager};
-use sensor::lsm303d::lsm303d::LSM303D;
-use sensor::lsm303d::{configuration::*, lsm303d::Measurements};
+use sensor::lsm303d::LSM303D;
+use sensor::lsm303d::{configuration::*, Measurements};
 
 use bsp::hal::pac::interrupt;
 
@@ -95,14 +95,13 @@ impl DelayMs<u32> for IrqDelayer {
     }
 }
 
-type VolumeManagerType = VolumeManager<
-    SdCard<
-        bsp::hal::Spi<bsp::hal::spi::Enabled, bsp::pac::SPI1, 8>,
-        gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
-        IrqDelayer,
-    >,
-    DummyTimesource,
+type SdCardType = SdCard<
+    bsp::hal::Spi<bsp::hal::spi::Enabled, pac::SPI1, 8>,
+    gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
+    IrqDelayer,
 >;
+
+type VolumeManagerType = VolumeManager<SdCardType, DummyTimesource>;
 struct SdWriter {
     file: Option<File>,
     volume_mgr: VolumeManagerType,
@@ -124,7 +123,7 @@ impl SdWriter {
             file: None,
             file_idx: 1,
             base_filename: ArrayString::from(file).unwrap(),
-            filename: filename,
+            filename,
             root_dir,
         }
     }
@@ -156,7 +155,7 @@ impl SdWriter {
                 .open_file_in_dir(
                     &mut self.volume,
                     &self.root_dir,
-                    &self.filename.as_str(),
+                    self.filename.as_str(),
                     embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
                 )
                 .unwrap();
@@ -300,7 +299,7 @@ fn main() -> ! {
         &mut pac.RESETS,
         &clocks.peripheral_clock,
     );
-    let mut sensor = sensor::lsm303d::lsm303d::LSM303D::new(i2c);
+    let mut sensor = sensor::lsm303d::LSM303D::new(i2c);
 
     sensor
         .configure(
@@ -315,7 +314,7 @@ fn main() -> ! {
                 .configure_magnetometer(
                     MagnetometerDataRate::Hz50,
                     MagneticSensorMode::ContinuousConversion,
-                    MagnetometerFullScale::Mag2Gauss,
+                    MagnetometerFullScale::Mag2,
                     MagnetometerResolution::Low,
                 )
                 .configure_temperature(true),
@@ -363,14 +362,8 @@ fn main() -> ! {
         IrqDelayer,
     > = embedded_sdmmc::SdCard::new(spi, spi_cs, IrqDelayer {});
 
-    let volume_mgr: VolumeManager<
-        SdCard<
-            bsp::hal::Spi<bsp::hal::spi::Enabled, pac::SPI1, 8>,
-            gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
-            IrqDelayer,
-        >,
-        DummyTimesource,
-    > = embedded_sdmmc::VolumeManager::new(sdcard, DummyTimesource {});
+    let volume_mgr: VolumeManager<SdCardType, DummyTimesource> =
+        embedded_sdmmc::VolumeManager::new(sdcard, DummyTimesource {});
 
     critical_section::with(|cs| {
         let mut alarm = timer.alarm_0().unwrap();
