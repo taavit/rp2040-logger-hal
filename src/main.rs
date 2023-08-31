@@ -10,6 +10,7 @@ use arrayvec::ArrayString;
 use bsp::hal::timer::Alarm;
 use bsp::hal::uart::UartPeripheral;
 use bsp::hal::Timer;
+use cortex_m::asm;
 use cortex_m::delay::Delay;
 use critical_section::Mutex;
 use embedded_sdmmc::{File, SdCard, TimeSource, Timestamp, VolumeManager};
@@ -108,6 +109,12 @@ impl TimeSource for DummyTimesource {
 }
 
 type ButtonPin = gpio::Pin<gpio::bank0::Gpio18, gpio::Input<PullDown>>;
+type ControlLed = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
+type IdleLed = gpio::Pin<gpio::bank0::Gpio16, gpio::Output<gpio::PushPull>>;
+type RecordingLed = gpio::Pin<gpio::bank0::Gpio17, gpio::Output<gpio::PushPull>>;
+
+type LedSet = (ControlLed, IdleLed, RecordingLed, RefCell<bool>);
+
 type I2CPin = bsp::hal::i2c::I2C<
     bsp::pac::I2C1,
     (
@@ -132,6 +139,7 @@ static UART: Mutex<RefCell<Option<UartLogger>>> = Mutex::new(RefCell::new(None))
 static SENSOR: Mutex<RefCell<Option<LSM303D<I2CPin>>>> = Mutex::new(RefCell::new(None));
 static SDWRITER: Mutex<RefCell<Option<SdWriter>>> = Mutex::new(RefCell::new(None));
 static DELAYER: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
+static LED_SET: Mutex<RefCell<Option<LedSet>>> = Mutex::new(RefCell::new(None));
 
 #[entry]
 fn main() -> ! {
@@ -209,8 +217,7 @@ fn main() -> ! {
         )
         .unwrap();
 
-    let mut led_pin = pins.led.into_push_pull_output();
-
+    let mut control_led = pins.led.into_push_pull_output();
     let mut idle_led = pins.gpio16.into_push_pull_output();
     let mut recording_led = pins.gpio17.into_push_pull_output();
 
@@ -264,15 +271,18 @@ fn main() -> ! {
         let mut alarm = timer.alarm_0().unwrap();
         let _ = alarm.schedule(MicrosDurationU32::Hz(10));
         alarm.enable_interrupt();
-
-        // Schedule an alarm in 1 second
-        // Enable generating an interrupt on alarm
         DEV_ALARM.replace(cs, Some(alarm));
         TIMER.replace(cs, Some(timer));
         GLOBAL_PINS.borrow(cs).replace(Some(in_pin));
         UART.borrow(cs).replace(Some(uart));
         SENSOR.borrow(cs).replace(Some(sensor));
         DELAYER.borrow(cs).replace(Some(delay));
+        LED_SET.borrow(cs).replace(Some((
+            control_led,
+            idle_led,
+            recording_led,
+            RefCell::new(false),
+        )));
     });
 
     let mut volume0 = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
@@ -282,7 +292,7 @@ fn main() -> ! {
         .open_file_in_dir(
             &mut volume0,
             &root_dir,
-            "a_1.csv",
+            "a_2.csv",
             embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
         )
         .unwrap();
@@ -294,28 +304,8 @@ fn main() -> ! {
         }));
     });
 
-    let mut delay = IrqDelayer {};
-
     loop {
-        let current_state = critical_section::with(|cs| *LOGGER_STATE.borrow(cs).borrow());
-        match current_state {
-            State::Idle => {
-                idle_led.set_high().unwrap();
-                led_pin.set_high().unwrap();
-                delay.delay_ms(50);
-                idle_led.set_low().unwrap();
-                led_pin.set_low().unwrap();
-                delay.delay_ms(50);
-            }
-            State::Recording => {
-                recording_led.set_high().unwrap();
-                led_pin.set_high().unwrap();
-                delay.delay_ms(50);
-                recording_led.set_low().unwrap();
-                led_pin.set_low().unwrap();
-                delay.delay_ms(50);
-            }
-        }
+        asm::wfi();
     }
 }
 
@@ -372,7 +362,8 @@ fn TIMER_IRQ_0() {
             .unwrap()
             .write_str(&buffer)
             .unwrap();
-
+        let mut leds = LED_SET.borrow_ref_mut(cs);
+        let leds = leds.as_mut().unwrap();
         if current_state == State::Recording {
             let sd_writer_raw = &mut SDWRITER.borrow_ref_mut(cs);
             let sd_writer = sd_writer_raw.as_mut().unwrap();
@@ -389,6 +380,27 @@ fn TIMER_IRQ_0() {
                     buffer.as_str().as_bytes(),
                 )
                 .unwrap();
+            leds.1.set_low().unwrap();
+            if *leds.3.borrow() {
+                leds.2.set_high().unwrap();
+                leds.0.set_high().unwrap();
+                leds.3.replace(false);
+            } else {
+                leds.2.set_low().unwrap();
+                leds.0.set_low().unwrap();
+                leds.3.replace(true);
+            }
+        } else {
+            leds.2.set_low().unwrap();
+            if *leds.3.borrow() {
+                leds.0.set_high().unwrap();
+                leds.1.set_high().unwrap();
+                leds.3.replace(false);
+            } else {
+                leds.0.set_low().unwrap();
+                leds.1.set_low().unwrap();
+                leds.3.replace(true);
+            }
         }
         buffer.clear();
         UART.borrow(cs)
@@ -399,7 +411,10 @@ fn TIMER_IRQ_0() {
             .unwrap();
         let mut alarm = DEV_ALARM.borrow(cs).borrow_mut();
         alarm.as_mut().unwrap().clear_interrupt();
-        let _ = alarm.as_mut().unwrap().schedule(MicrosDurationU32::Hz(10));
+        let _ = alarm
+            .as_mut()
+            .unwrap()
+            .schedule(MicrosDurationU32::millis(50));
     });
 }
 
