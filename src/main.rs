@@ -8,7 +8,6 @@ mod sensor;
 
 use arrayvec::{ArrayString, ArrayVec};
 use bsp::hal::timer::Alarm;
-use bsp::hal::uart::UartPeripheral;
 use bsp::hal::Timer;
 use cortex_m::asm;
 use cortex_m::delay::Delay;
@@ -21,12 +20,10 @@ use bsp::hal::pac::interrupt;
 
 use bsp::{
     entry,
-    hal::{
-        gpio::PullDown,
-        timer::Instant,
-        uart::{DataBits, StopBits, UartConfig},
-    },
+    hal::{gpio::PullDown, timer::Instant},
 };
+use usb_device::{class_prelude::*, prelude::*};
+use usbd_serial::SerialPort;
 
 use core::panic::PanicInfo;
 use core::{cell::RefCell, fmt::Write};
@@ -127,6 +124,7 @@ impl SdWriter {
             root_dir,
         }
     }
+
     pub fn write(&mut self, data: &str) {
         critical_section::with(|cs| {
             if let Some(ref mut file) = self.file {
@@ -225,21 +223,24 @@ type I2CPin = bsp::hal::i2c::I2C<
     ),
 >;
 
-type UartLogger = UartPeripheral<
-    bsp::hal::uart::Enabled,
-    bsp::pac::UART0,
-    (
-        gpio::Pin<gpio::bank0::Gpio0, gpio::Function<gpio::Uart>>,
-        gpio::Pin<gpio::bank0::Gpio1, gpio::Function<gpio::Uart>>,
-    ),
->;
+type SerialLogger<'a> = SerialPort<'a, bsp::hal::usb::UsbBus>;
+
 static GLOBAL_PINS: Mutex<RefCell<Option<ButtonPin>>> = Mutex::new(RefCell::new(None));
 static LOGGER_STATE: Mutex<RefCell<State>> = Mutex::new(RefCell::new(State::Idle));
 static TIMER: Mutex<RefCell<Option<Timer>>> = Mutex::new(RefCell::new(None));
 static DEV_ALARM: Mutex<RefCell<Option<bsp::hal::timer::Alarm0>>> = Mutex::new(RefCell::new(None));
-static UART: Mutex<RefCell<Option<UartLogger>>> = Mutex::new(RefCell::new(None));
 static SENSOR: Mutex<RefCell<Option<LSM303D<I2CPin>>>> = Mutex::new(RefCell::new(None));
 static SDWRITER: Mutex<RefCell<Option<SdWriter>>> = Mutex::new(RefCell::new(None));
+
+static USBSTACK: Mutex<
+    RefCell<
+        Option<(
+            UsbBusAllocator<bsp::hal::usb::UsbBus>,
+            UsbDevice<'_, bsp::hal::usb::UsbBus>,
+            SerialLogger,
+        )>,
+    >,
+> = Mutex::new(RefCell::new(None));
 static DELAYER: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
 static LED_SET: Mutex<RefCell<Option<LedSet>>> = Mutex::new(RefCell::new(None));
 static CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 10>>> =
@@ -274,19 +275,6 @@ fn main() -> ! {
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
-
-    let uart_pins = (
-        // UART TX (characters sent from RP2040) on pin 1 (GPIO0)
-        pins.gpio0.into_mode::<gpio::FunctionUart>(),
-        // UART RX (characters received by RP2040) on pin 2 (GPIO1)
-        pins.gpio1.into_mode::<gpio::FunctionUart>(),
-    );
-    let uart = bsp::hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
-        .enable(
-            UartConfig::new(115_200.Hz(), DataBits::Eight, None, StopBits::One),
-            clocks.peripheral_clock.freq(),
-        )
-        .unwrap();
 
     let sda_pin = pins.gpio14.into_mode::<bsp::hal::gpio::FunctionI2C>();
     let scl_pin = pins.gpio15.into_mode::<bsp::hal::gpio::FunctionI2C>();
@@ -372,7 +360,6 @@ fn main() -> ! {
         DEV_ALARM.replace(cs, Some(alarm));
         TIMER.replace(cs, Some(timer));
         GLOBAL_PINS.borrow(cs).replace(Some(in_pin));
-        UART.borrow(cs).replace(Some(uart));
         SENSOR.borrow(cs).replace(Some(sensor));
         DELAYER.borrow(cs).replace(Some(delay));
         LED_SET.borrow(cs).replace(Some((
@@ -381,6 +368,22 @@ fn main() -> ! {
             recording_led,
             RefCell::new(false),
         )));
+        let usb_bus = UsbBusAllocator::new(bsp::hal::usb::UsbBus::new(
+            pac.USBCTRL_REGS,
+            pac.USBCTRL_DPRAM,
+            clocks.usb_clock,
+            true,
+            &mut pac.RESETS,
+        ));
+
+        let serial = SerialPort::new(&usb_bus);
+        let usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
+            .manufacturer("Taavit company")
+            .product("Serial port")
+            .serial_number("000000")
+            .device_class(2) // from: https://www.usb.org/defined-class-codes
+            .build();
+        USBSTACK.replace(cs, Some((usb_bus, usb_dev, serial)));
     });
 
     critical_section::with(|cs| {
@@ -390,6 +393,10 @@ fn main() -> ! {
     });
 
     loop {
+        critical_section::with(|cs| {
+            let (_, mut usb_dev, mut serial) = USBSTACK.borrow_ref_mut(cs).unwrap();
+            usb_dev.poll(&mut [&mut serial]);
+        });
         asm::wfi();
     }
 }
@@ -441,12 +448,9 @@ fn TIMER_IRQ_0() {
                 .unwrap_or(MicrosDurationU64::from_ticks(0)),
         );
 
-        UART.borrow(cs)
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .write_str(&buffer)
-            .unwrap();
+        let (mut usb_dev, mut usb_bus, mut serial) = USBSTACK.borrow_ref_mut(cs).unwrap();
+        serial.write(buffer.as_bytes()).unwrap();
+
         let mut leds = LED_SET.borrow_ref_mut(cs);
         let leds = leds.as_mut().unwrap();
         if current_state == State::Recording {
@@ -476,12 +480,7 @@ fn TIMER_IRQ_0() {
             }
         }
         buffer.clear();
-        UART.borrow(cs)
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .write_str(&buffer)
-            .unwrap();
+        serial.write(buffer.as_bytes()).unwrap();
         let mut alarm = DEV_ALARM.borrow(cs).borrow_mut();
         alarm.as_mut().unwrap().clear_interrupt();
         let _ = alarm
@@ -527,12 +526,9 @@ fn IO_IRQ_BANK0() {
 
 fn uart_write(a: &str) {
     critical_section::with(|cs| {
-        UART.borrow(cs)
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .write_str(a)
-            .unwrap();
+        let mut stack = USBSTACK.borrow_ref_mut(cs);
+        let (_, _, ref mut serial) = stack.as_mut().unwrap();
+        serial.write(a.as_bytes()).unwrap();
     });
 }
 

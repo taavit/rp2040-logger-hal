@@ -18,6 +18,8 @@ fugit = "0.3.7"
 arrayvec = { version = "0.7.4", default-features = false }
 critical-section = "1.1.2"
 embedded-sdmmc = "0.5.0"
+usbd-serial = "0.1.1"
+usb-device = "0.2.9"
 
 # but you can use any BSP. Uncomment this to use the pro_micro_rp2040 BSP instead
 # sparkfun-pro-micro-rp2040 = "0.6"
