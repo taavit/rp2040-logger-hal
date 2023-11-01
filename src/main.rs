@@ -27,6 +27,9 @@ use bsp::{
         uart::{DataBits, StopBits, UartConfig},
     },
 };
+use usb_device::class_prelude::{UsbBusAllocator, UsbClass};
+use usb_device::prelude::{UsbDevice, UsbDeviceBuilder, UsbVidPid};
+use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 use core::panic::PanicInfo;
 use core::{cell::RefCell, fmt::Write};
@@ -245,6 +248,18 @@ static LED_SET: Mutex<RefCell<Option<LedSet>>> = Mutex::new(RefCell::new(None));
 static CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 10>>> =
     Mutex::new(RefCell::new(ArrayVec::new_const()));
 
+static USB_CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 1000>>> =
+    Mutex::new(RefCell::new(ArrayVec::new_const()));
+
+/// The USB Device Driver (shared with the interrupt).
+static mut USB_DEVICE: Option<UsbDevice<bsp::hal::usb::UsbBus>> = None;
+
+/// The USB Bus Driver (shared with the interrupt).
+static mut USB_BUS: Option<UsbBusAllocator<bsp::hal::usb::UsbBus>> = None;
+
+/// The USB Serial Port Driver (shared with the interrupt).
+static mut USB_SERIAL: Option<SerialPort<bsp::hal::usb::UsbBus, [u8; 1024], [u8; 1024]>> = None;
+
 #[entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
@@ -335,10 +350,45 @@ fn main() -> ! {
     in_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
     in_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
 
+    // Init usb device
+    let force_vbus_detect_bit = true;
+
+    let usb_bus = bsp::hal::usb::UsbBus::new(
+        pac.USBCTRL_REGS,
+        pac.USBCTRL_DPRAM,
+        clocks.usb_clock,
+        force_vbus_detect_bit,
+        &mut pac.RESETS,
+    );
+
+    let bus_allocator = UsbBusAllocator::new(usb_bus);
+    let bus_ref = unsafe {
+        // Note (safety): This is safe as interrupts haven't been started yet
+        USB_BUS = Some(bus_allocator);
+        // We are promising to the compiler not to take mutable access to this global
+        // variable while this reference exists!
+        USB_BUS.as_ref().unwrap()
+    };
+
+    let usb_serial = SerialPort::new_with_store(bus_ref, [0u8; 1024], [0u8; 1024]);
+
+    let usb_dev = UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd))
+        .product("AccMag tracker")
+        .device_class(USB_CLASS_CDC)
+        .build();
+
     unsafe {
+        // Note (safety): This is safe as interrupts haven't been started yet
+        USB_SERIAL = Some(usb_serial);
+        USB_DEVICE = Some(usb_dev);
+    }
+
+    unsafe {
+        pac::NVIC::unmask(bsp::hal::pac::Interrupt::USBCTRL_IRQ);
         pac::NVIC::unmask(bsp::hal::pac::Interrupt::IO_IRQ_BANK0);
         pac::NVIC::unmask(bsp::hal::pac::Interrupt::TIMER_IRQ_0);
     };
+
     // These are implicitly used by the spi driver if they are in the correct mode
     let _spi_sclk = pins.gpio10.into_mode::<gpio::FunctionSpi>();
     let _spi_mosi = pins.gpio11.into_mode::<gpio::FunctionSpi>();
@@ -414,6 +464,23 @@ fn format_measurements<const SIZE: usize>(
     .unwrap();
 }
 
+#[allow(non_snake_case)]
+#[interrupt]
+unsafe fn USBCTRL_IRQ() {
+    let usb_dev = USB_DEVICE.as_mut().unwrap();
+    let usb_serial = USB_SERIAL.as_mut().unwrap();
+    if !usb_dev.poll(&mut [usb_serial]) {
+        return;
+    }
+
+    critical_section::with(|cs| {
+        let mut vec = USB_CACHE.borrow_ref_mut(cs);
+        for row in vec.drain(..) {
+            usb_serial.write(row.as_bytes()).unwrap();
+        }
+    });
+}
+
 #[interrupt]
 fn TIMER_IRQ_0() {
     critical_section::with(|cs| {
@@ -441,12 +508,8 @@ fn TIMER_IRQ_0() {
                 .unwrap_or(MicrosDurationU64::from_ticks(0)),
         );
 
-        UART.borrow(cs)
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .write_str(&buffer)
-            .unwrap();
+        uart_write(buffer.as_str());
+        USB_CACHE.borrow_ref_mut(cs).push(buffer);
         let mut leds = LED_SET.borrow_ref_mut(cs);
         let leds = leds.as_mut().unwrap();
         if current_state == State::Recording {
