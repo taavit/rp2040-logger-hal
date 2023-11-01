@@ -384,7 +384,7 @@ fn main() -> ! {
     }
 
     unsafe {
-        pac::NVIC::unmask(bsp::hal::pac::Interrupt::USBCTRL_IRQ);
+        // pac::NVIC::unmask(bsp::hal::pac::Interrupt::USBCTRL_IRQ);
         pac::NVIC::unmask(bsp::hal::pac::Interrupt::IO_IRQ_BANK0);
         pac::NVIC::unmask(bsp::hal::pac::Interrupt::TIMER_IRQ_0);
     };
@@ -441,6 +441,18 @@ fn main() -> ! {
 
     loop {
         asm::wfi();
+        let usb_dev = unsafe { USB_DEVICE.as_mut().unwrap() };
+        let usb_serial = unsafe { USB_SERIAL.as_mut().unwrap() };
+        if !usb_dev.poll(&mut [usb_serial]) {
+            continue;
+        }
+
+        critical_section::with(|cs| {
+            let mut vec = USB_CACHE.borrow_ref_mut(cs);
+            for row in vec.drain(..) {
+                let _ = usb_serial.write(row.as_bytes());
+            }
+        });
     }
 }
 
@@ -462,23 +474,6 @@ fn format_measurements<const SIZE: usize>(
         measurements.magnetometer.z,
     )
     .unwrap();
-}
-
-#[allow(non_snake_case)]
-#[interrupt]
-unsafe fn USBCTRL_IRQ() {
-    let usb_dev = USB_DEVICE.as_mut().unwrap();
-    let usb_serial = USB_SERIAL.as_mut().unwrap();
-    if !usb_dev.poll(&mut [usb_serial]) {
-        return;
-    }
-
-    critical_section::with(|cs| {
-        let mut vec = USB_CACHE.borrow_ref_mut(cs);
-        for row in vec.drain(..) {
-            usb_serial.write(row.as_bytes()).unwrap();
-        }
-    });
 }
 
 #[interrupt]
