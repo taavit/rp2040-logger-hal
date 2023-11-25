@@ -109,7 +109,7 @@ struct SdWriter {
     file: Option<File>,
     volume_mgr: VolumeManagerType,
     volume: Volume,
-    root_dir: Directory,
+    root_dir: Option<Directory>,
     file_idx: u16,
     base_filename: ArrayString<16>,
     filename: ArrayString<32>,
@@ -118,7 +118,6 @@ struct SdWriter {
 impl SdWriter {
     pub fn new(file: &str, mut volume_mgr: VolumeManagerType) -> Self {
         let volume = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
-        let root_dir = volume_mgr.open_root_dir(&volume).unwrap();
         let filename = ArrayString::new();
         Self {
             volume,
@@ -127,7 +126,7 @@ impl SdWriter {
             file_idx: 1,
             base_filename: ArrayString::from(file).unwrap(),
             filename,
-            root_dir,
+            root_dir: None,
         }
     }
     pub fn write(&mut self, data: &str) {
@@ -153,16 +152,21 @@ impl SdWriter {
 
         critical_section::with(|cs| {
             CACHE.borrow(cs).borrow_mut().clear();
+            if let Some(dir) = self.root_dir.take() {
+                self.volume_mgr.close_dir(&self.volume, dir);
+            }
+            let root_dir = self.volume_mgr.open_root_dir(&mut self.volume).unwrap();
             let csv_file = self
                 .volume_mgr
                 .open_file_in_dir(
                     &mut self.volume,
-                    &self.root_dir,
+                    &root_dir,
                     self.filename.as_str(),
                     embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
                 )
                 .unwrap();
             self.file = Some(csv_file);
+            self.root_dir = Some(root_dir);
         });
     }
 
@@ -180,6 +184,10 @@ impl SdWriter {
                     .unwrap();
                 self.volume_mgr.close_file(&self.volume, file).unwrap();
             };
+            let root_dir = self.root_dir.take();
+            if let Some(root_dir) = root_dir {
+                self.volume_mgr.close_dir(&self.volume, root_dir);
+            }
             self.file_idx += 1;
         })
     }
@@ -248,7 +256,7 @@ static LED_SET: Mutex<RefCell<Option<LedSet>>> = Mutex::new(RefCell::new(None));
 static CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 10>>> =
     Mutex::new(RefCell::new(ArrayVec::new_const()));
 
-static USB_CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 1000>>> =
+static USB_CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 100>>> =
     Mutex::new(RefCell::new(ArrayVec::new_const()));
 
 /// The USB Device Driver (shared with the interrupt).
@@ -258,7 +266,7 @@ static mut USB_DEVICE: Option<UsbDevice<bsp::hal::usb::UsbBus>> = None;
 static mut USB_BUS: Option<UsbBusAllocator<bsp::hal::usb::UsbBus>> = None;
 
 /// The USB Serial Port Driver (shared with the interrupt).
-static mut USB_SERIAL: Option<SerialPort<bsp::hal::usb::UsbBus, [u8; 1024], [u8; 1024]>> = None;
+static mut USB_SERIAL: Option<SerialPort<bsp::hal::usb::UsbBus>> = None;
 
 #[entry]
 fn main() -> ! {
@@ -370,7 +378,7 @@ fn main() -> ! {
         USB_BUS.as_ref().unwrap()
     };
 
-    let usb_serial = SerialPort::new_with_store(bus_ref, [0u8; 1024], [0u8; 1024]);
+    let usb_serial = SerialPort::new(bus_ref);
 
     let usb_dev = UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd))
         .product("AccMag tracker")
@@ -464,25 +472,32 @@ fn format_measurements<const SIZE: usize>(
     .unwrap();
 }
 
-#[allow(non_snake_case)]
-#[interrupt]
-unsafe fn USBCTRL_IRQ() {
+unsafe fn handle_usbctrl() {
     let usb_dev = USB_DEVICE.as_mut().unwrap();
     let usb_serial = USB_SERIAL.as_mut().unwrap();
     if !usb_dev.poll(&mut [usb_serial]) {
         return;
     }
-
     critical_section::with(|cs| {
         let mut vec = USB_CACHE.borrow_ref_mut(cs);
         for row in vec.drain(..) {
-            usb_serial.write(row.as_bytes()).unwrap();
+            let e = usb_serial.write(row.as_bytes());
+            if e.is_err() {
+                let mut buf = ArrayString::<128>::new();
+                let _ = write!(buf, "Problem with writing: {}\r\n", &row[..16]);
+                uart_write(buf.as_str());
+            }
         }
     });
 }
-
+#[allow(non_snake_case)]
 #[interrupt]
-fn TIMER_IRQ_0() {
+unsafe fn USBCTRL_IRQ() {
+    handle_button();
+    handle_usbctrl();
+}
+
+fn handle_timer() {
     critical_section::with(|cs| {
         let current_state: State = *LOGGER_STATE.borrow_ref(cs);
         let measurements = SENSOR
@@ -509,7 +524,12 @@ fn TIMER_IRQ_0() {
         );
 
         uart_write(buffer.as_str());
-        USB_CACHE.borrow_ref_mut(cs).push(buffer);
+        let mut cache = USB_CACHE.borrow_ref_mut(cs);
+        if cache.is_full() {
+            cache.pop_at(0);
+        }
+        cache.push(buffer);
+        drop(cache);
         let mut leds = LED_SET.borrow_ref_mut(cs);
         let leds = leds.as_mut().unwrap();
         if current_state == State::Recording {
@@ -555,7 +575,11 @@ fn TIMER_IRQ_0() {
 }
 
 #[interrupt]
-fn IO_IRQ_BANK0() {
+fn TIMER_IRQ_0() {
+    handle_timer();
+}
+
+fn handle_button() {
     critical_section::with(|cs| {
         let mut pin = GLOBAL_PINS.borrow(cs).borrow_mut();
         let button = pin.as_mut();
@@ -586,6 +610,11 @@ fn IO_IRQ_BANK0() {
             }
         }
     });
+}
+
+#[interrupt]
+fn IO_IRQ_BANK0() {
+    handle_button();
 }
 
 fn uart_write(a: &str) {
