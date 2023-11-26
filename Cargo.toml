@@ -15,7 +15,7 @@ panic-probe = { version = "0.3", features = ["print-defmt"] }
 # We're using a Pico by default on this template
 rp-pico = { version = "0.8" }
 fugit = "0.3.7"
-critical-section = "1.1.2"
+critical-section = { version = "1.1.2", features = ["restore-state-u8"] }
 embedded-sdmmc = "0.6.0"
 usb-device = "0.2.9"
 usbd-serial = "0.1.1"
@@ -23,13 +23,10 @@ heapless = { version = "0.8.0", features = [
     "portable-atomic-critical-section",
 ] }
 portable-atomic = { version = "1.5.1", features = ["critical-section"] }
-
-# but you can use any BSP. Uncomment this to use the pro_micro_rp2040 BSP instead
-# sparkfun-pro-micro-rp2040 = "0.6"
-
-# If you're not going to use a Board Support Package you'll need these:
-# rp2040-hal = { version="0.8", features=["rt", "critical-section-impl"] }
-# rp2040-boot2 = "0.2"
+rp2040-hal = { version = "0.9.1", features = [
+    "rom-v2-intrinsics",
+    "critical-section-impl",
+] }
 
 # cargo build/run
 [profile.dev]

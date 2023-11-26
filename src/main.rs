@@ -4,16 +4,17 @@
 #![no_std]
 #![no_main]
 
+mod sd_writer;
 mod sensor;
 
 use bsp::hal::gpio::{Pin, PullNone, PullUp};
 use bsp::hal::timer::Alarm;
 use bsp::hal::uart::UartPeripheral;
 use bsp::hal::Timer;
-use cortex_m::delay::Delay;
 use critical_section::Mutex;
-use embedded_sdmmc::{Directory, File, SdCard, TimeSource, Timestamp, Volume, VolumeManager};
+use embedded_sdmmc::{SdCard, VolumeManager};
 use heapless::{String, Vec};
+use sd_writer::{DummyTimesource, SdWriter};
 use sensor::lsm303d::LSM303D;
 use sensor::lsm303d::{configuration::*, Measurements};
 
@@ -28,11 +29,10 @@ use bsp::{
     },
 };
 use usb_device::class_prelude::UsbBusAllocator;
-use usb_device::prelude::{UsbDevice, UsbDeviceBuilder, UsbVidPid};
+use usb_device::prelude::{UsbDeviceBuilder, UsbVidPid};
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 use core::panic::PanicInfo;
-use core::str::FromStr;
 use core::{cell::RefCell, fmt::Write};
 use embedded_hal::digital::v2::OutputPin;
 use fugit::{MicrosDurationU32, MicrosDurationU64, RateExtU32};
@@ -45,8 +45,6 @@ use bsp::hal::{
     sio::Sio,
     watchdog::Watchdog,
 };
-use embedded_hal::blocking::delay::DelayMs;
-use embedded_hal::blocking::delay::DelayUs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -71,34 +69,6 @@ impl State {
     }
 }
 
-struct IrqDelayer {}
-
-impl DelayUs<u8> for IrqDelayer {
-    fn delay_us(&mut self, us: u8) {
-        critical_section::with(|cs| {
-            DELAYER
-                .borrow(cs)
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .delay_us(us as u32);
-        })
-    }
-}
-
-impl DelayMs<u32> for IrqDelayer {
-    fn delay_ms(&mut self, ms: u32) {
-        critical_section::with(|cs| {
-            DELAYER
-                .borrow(cs)
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .delay_ms(ms);
-        });
-    }
-}
-
 type SdCardType = SdCard<
     bsp::hal::Spi<
         bsp::hal::spi::Enabled,
@@ -110,126 +80,8 @@ type SdCardType = SdCard<
         ),
     >,
     Pin<gpio::bank0::Gpio13, gpio::FunctionSio<gpio::SioOutput>, PullDown>,
-    IrqDelayer,
+    Timer,
 >;
-
-type VolumeManagerType = VolumeManager<SdCardType, DummyTimesource>;
-struct SdWriter {
-    file: Option<File>,
-    volume_mgr: VolumeManagerType,
-    volume: Volume,
-    root_dir: Option<Directory>,
-    file_idx: u16,
-    base_filename: String<16>,
-    filename: String<32>,
-}
-
-impl SdWriter {
-    pub fn new(file: &str, mut volume_mgr: VolumeManagerType) -> Self {
-        let volume = volume_mgr
-            .open_volume(embedded_sdmmc::VolumeIdx(0))
-            .unwrap();
-        let filename = String::new();
-        Self {
-            volume,
-            volume_mgr,
-            file: None,
-            file_idx: 1,
-            base_filename: String::from_str(file).unwrap(),
-            filename,
-            root_dir: None,
-        }
-    }
-    pub fn write(&mut self, data: &str) {
-        critical_section::with(|cs| {
-            if let Some(ref mut file) = self.file {
-                let mut cache = CACHE.borrow(cs).borrow_mut();
-                cache.push(String::from_str(data).unwrap()).unwrap();
-                if cache.is_full() {
-                    let mut full_string = String::<640>::new();
-                    for e in cache.iter() {
-                        full_string.push_str(e.as_str()).unwrap();
-                    }
-                    cache.clear();
-                    self.volume_mgr
-                        .write(*file, full_string.as_bytes())
-                        .unwrap();
-                }
-            }
-        });
-    }
-
-    pub fn start_recording(&mut self) {
-        self.generate_filename();
-
-        critical_section::with(|cs| {
-            CACHE.borrow(cs).borrow_mut().clear();
-            if let Some(dir) = self.root_dir.take() {
-                self.volume_mgr.close_dir(dir).unwrap();
-            }
-            let root_dir = self.volume_mgr.open_root_dir(self.volume).unwrap();
-            let csv_file = self
-                .volume_mgr
-                .open_file_in_dir(
-                    root_dir,
-                    self.filename.as_str(),
-                    embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
-                )
-                .unwrap();
-            self.file = Some(csv_file);
-            self.root_dir = Some(root_dir);
-        });
-    }
-
-    pub fn stop_recording(&mut self) {
-        critical_section::with(|cs| {
-            if let Some(file) = self.file.take() {
-                let mut cache = CACHE.borrow(cs).borrow_mut();
-
-                let mut full_string = String::<640>::new();
-                for e in cache.iter() {
-                    full_string.push_str(e.as_str()).unwrap();
-                }
-                cache.clear();
-                self.volume_mgr.write(file, full_string.as_bytes()).unwrap();
-                self.volume_mgr.close_file(file).unwrap();
-            };
-            let root_dir = self.root_dir.take();
-            if let Some(root_dir) = root_dir {
-                self.volume_mgr.close_dir(root_dir).unwrap();
-            }
-            self.file_idx += 1;
-        })
-    }
-
-    fn generate_filename(&mut self) {
-        self.filename.clear();
-        write!(
-            self.filename,
-            "{}_{:05}.csv",
-            self.base_filename, self.file_idx
-        )
-        .unwrap();
-    }
-}
-
-#[derive(Default)]
-pub struct DummyTimesource();
-
-impl TimeSource for DummyTimesource {
-    // In theory you could use the RTC of the rp2040 here, if you had
-    // any external time synchronizing device.
-    fn get_timestamp(&self) -> Timestamp {
-        Timestamp {
-            year_since_1970: 0,
-            zero_indexed_month: 0,
-            zero_indexed_day: 0,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
-        }
-    }
-}
 
 type ButtonPin = Pin<gpio::bank0::Gpio18, gpio::FunctionSio<gpio::SioInput>, PullDown>;
 type ControlLed = Pin<gpio::bank0::Gpio25, gpio::FunctionSio<gpio::SioOutput>, PullDown>;
@@ -261,25 +113,14 @@ static DEV_ALARM: Mutex<RefCell<Option<bsp::hal::timer::Alarm0>>> = Mutex::new(R
 static UART: Mutex<RefCell<Option<UartLogger>>> = Mutex::new(RefCell::new(None));
 static SENSOR: Mutex<RefCell<Option<LSM303D<I2CPin>>>> = Mutex::new(RefCell::new(None));
 static SDWRITER: Mutex<RefCell<Option<SdWriter>>> = Mutex::new(RefCell::new(None));
-static DELAYER: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
 static LED_SET: Mutex<RefCell<Option<LedSet>>> = Mutex::new(RefCell::new(None));
 static CACHE: Mutex<RefCell<Vec<String<64>, 10>>> = Mutex::new(RefCell::new(Vec::new()));
 
 static USB_CACHE: Mutex<RefCell<Vec<String<64>, 100>>> = Mutex::new(RefCell::new(Vec::new()));
 
-/// The USB Device Driver (shared with the interrupt).
-static mut USB_DEVICE: Option<UsbDevice<bsp::hal::usb::UsbBus>> = None;
-
-/// The USB Bus Driver (shared with the interrupt).
-static mut USB_BUS: Option<UsbBusAllocator<bsp::hal::usb::UsbBus>> = None;
-
-/// The USB Serial Port Driver (shared with the interrupt).
-static mut USB_SERIAL: Option<SerialPort<bsp::hal::usb::UsbBus>> = None;
-
 #[entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
 
@@ -297,8 +138,8 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-
+    // let delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let mut delay = rp2040_hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -356,8 +197,6 @@ fn main() -> ! {
     let idle_led = pins.gpio16.into_push_pull_output();
     let recording_led = pins.gpio17.into_push_pull_output();
 
-    let mut timer = bsp::hal::timer::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
-
     // Set up the GPIO pin that will be our input
     let in_pin = pins.gpio18.into_pull_down_input();
 
@@ -378,26 +217,12 @@ fn main() -> ! {
     );
 
     let bus_allocator = UsbBusAllocator::new(usb_bus);
-    let bus_ref = unsafe {
-        // Note (safety): This is safe as interrupts haven't been started yet
-        USB_BUS = Some(bus_allocator);
-        // We are promising to the compiler not to take mutable access to this global
-        // variable while this reference exists!
-        USB_BUS.as_ref().unwrap()
-    };
+    let mut usb_serial = SerialPort::new(&bus_allocator);
 
-    let usb_serial = SerialPort::new(bus_ref);
-
-    let usb_dev = UsbDeviceBuilder::new(bus_ref, UsbVidPid(0x16c0, 0x27dd))
+    let mut usb_dev = UsbDeviceBuilder::new(&bus_allocator, UsbVidPid(0x16c0, 0x27dd))
         .product("AccMag tracker")
         .device_class(USB_CLASS_CDC)
         .build();
-
-    unsafe {
-        // Note (safety): This is safe as interrupts haven't been started yet
-        USB_SERIAL = Some(usb_serial);
-        USB_DEVICE = Some(usb_dev);
-    }
 
     unsafe {
         // Interrupt for USBCTRL disables for unknown reason IO_IRQ_BANK0 and buttons,
@@ -422,24 +247,23 @@ fn main() -> ! {
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
         400.kHz(), // card initialization happens at low baud rate
-        &embedded_hal::spi::MODE_0,
+        embedded_hal::spi::MODE_0,
     );
 
-    let sdcard = embedded_sdmmc::SdCard::new(spi, spi_cs, IrqDelayer {});
+    let sdcard = embedded_sdmmc::SdCard::new(spi, spi_cs, delay);
 
     let volume_mgr: VolumeManager<SdCardType, DummyTimesource> =
         embedded_sdmmc::VolumeManager::new(sdcard, DummyTimesource {});
 
     critical_section::with(|cs| {
-        let mut alarm = timer.alarm_0().unwrap();
+        let mut alarm = delay.alarm_0().unwrap();
         let _ = alarm.schedule(MicrosDurationU32::Hz(10));
         alarm.enable_interrupt();
         DEV_ALARM.replace(cs, Some(alarm));
-        TIMER.replace(cs, Some(timer));
+        TIMER.replace(cs, Some(delay));
         GLOBAL_PINS.borrow(cs).replace(Some(in_pin));
         UART.borrow(cs).replace(Some(uart));
         SENSOR.borrow(cs).replace(Some(sensor));
-        DELAYER.borrow(cs).replace(Some(delay));
         LED_SET.borrow(cs).replace(Some((
             control_led,
             idle_led,
@@ -455,8 +279,19 @@ fn main() -> ! {
     });
 
     loop {
-        unsafe {
-            handle_usbctrl();
+        if usb_dev.poll(&mut [&mut usb_serial]) {
+            critical_section::with(|cs| {
+                let mut vec = USB_CACHE.borrow_ref_mut(cs);
+                for row in vec.iter() {
+                    let e = usb_serial.write(row.as_bytes());
+                    if e.is_err() {
+                        let mut buf = String::<128>::new();
+                        let _ = write!(buf, "Problem with writing: {}\r\n", &row[..16]);
+                        uart_write(buf.as_str());
+                    }
+                }
+                vec.clear();
+            });
         }
     }
 }
@@ -480,32 +315,6 @@ fn format_measurements<const SIZE: usize>(
     )
     .unwrap();
 }
-
-unsafe fn handle_usbctrl() {
-    let usb_dev = USB_DEVICE.as_mut().unwrap();
-    let usb_serial = USB_SERIAL.as_mut().unwrap();
-    if !usb_dev.poll(&mut [usb_serial]) {
-        return;
-    }
-    critical_section::with(|cs| {
-        let mut vec = USB_CACHE.borrow_ref_mut(cs);
-        for row in vec.iter() {
-            let e = usb_serial.write(row.as_bytes());
-            if e.is_err() {
-                let mut buf = String::<128>::new();
-                let _ = write!(buf, "Problem with writing: {}\r\n", &row[..16]);
-                uart_write(buf.as_str());
-            }
-        }
-        vec.clear();
-    });
-}
-// #[allow(non_snake_case)]
-// #[interrupt]
-// unsafe fn USBCTRL_IRQ() {
-//     handle_button();
-//     handle_usbctrl();
-// }
 
 fn handle_timer() {
     critical_section::with(|cs| {
