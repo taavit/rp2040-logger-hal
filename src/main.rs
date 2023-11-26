@@ -6,10 +6,10 @@
 
 mod sensor;
 
+use bsp::hal::gpio::{Pin, PullNone, PullUp};
 use bsp::hal::timer::Alarm;
 use bsp::hal::uart::UartPeripheral;
 use bsp::hal::Timer;
-use cortex_m::asm;
 use cortex_m::delay::Delay;
 use critical_section::Mutex;
 use embedded_sdmmc::{Directory, File, SdCard, TimeSource, Timestamp, Volume, VolumeManager};
@@ -100,8 +100,16 @@ impl DelayMs<u32> for IrqDelayer {
 }
 
 type SdCardType = SdCard<
-    bsp::hal::Spi<bsp::hal::spi::Enabled, pac::SPI1, 8>,
-    gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
+    bsp::hal::Spi<
+        bsp::hal::spi::Enabled,
+        pac::SPI1,
+        (
+            Pin<gpio::bank0::Gpio11, gpio::FunctionSpi, PullNone>,
+            Pin<gpio::bank0::Gpio12, gpio::FunctionSpi, PullUp>,
+            Pin<gpio::bank0::Gpio10, gpio::FunctionSpi, PullNone>,
+        ),
+    >,
+    Pin<gpio::bank0::Gpio13, gpio::FunctionSio<gpio::SioOutput>, PullDown>,
     IrqDelayer,
 >;
 
@@ -223,27 +231,27 @@ impl TimeSource for DummyTimesource {
     }
 }
 
-type ButtonPin = gpio::Pin<gpio::bank0::Gpio18, gpio::Input<PullDown>>;
-type ControlLed = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
-type IdleLed = gpio::Pin<gpio::bank0::Gpio16, gpio::Output<gpio::PushPull>>;
-type RecordingLed = gpio::Pin<gpio::bank0::Gpio17, gpio::Output<gpio::PushPull>>;
+type ButtonPin = Pin<gpio::bank0::Gpio18, gpio::FunctionSio<gpio::SioInput>, PullDown>;
+type ControlLed = Pin<gpio::bank0::Gpio25, gpio::FunctionSio<gpio::SioOutput>, PullDown>;
+type IdleLed = Pin<gpio::bank0::Gpio16, gpio::FunctionSio<gpio::SioOutput>, PullDown>;
+type RecordingLed = Pin<gpio::bank0::Gpio17, gpio::FunctionSio<gpio::SioOutput>, PullDown>;
 
 type LedSet = (ControlLed, IdleLed, RecordingLed, RefCell<bool>);
 
 type I2CPin = bsp::hal::i2c::I2C<
     bsp::pac::I2C1,
     (
-        gpio::Pin<gpio::bank0::Gpio14, gpio::FunctionI2C>,
-        gpio::Pin<gpio::bank0::Gpio15, gpio::FunctionI2C>,
+        Pin<gpio::bank0::Gpio14, gpio::FunctionI2C, PullDown>,
+        Pin<gpio::bank0::Gpio15, gpio::FunctionI2C, PullDown>,
     ),
 >;
 
 type UartLogger = UartPeripheral<
     bsp::hal::uart::Enabled,
-    bsp::pac::UART0,
+    pac::UART0,
     (
-        gpio::Pin<gpio::bank0::Gpio0, gpio::Function<gpio::Uart>>,
-        gpio::Pin<gpio::bank0::Gpio1, gpio::Function<gpio::Uart>>,
+        Pin<gpio::bank0::Gpio0, gpio::FunctionUart, PullDown>,
+        Pin<gpio::bank0::Gpio1, gpio::FunctionUart, PullDown>,
     ),
 >;
 static GLOBAL_PINS: Mutex<RefCell<Option<ButtonPin>>> = Mutex::new(RefCell::new(None));
@@ -300,9 +308,9 @@ fn main() -> ! {
 
     let uart_pins = (
         // UART TX (characters sent from RP2040) on pin 1 (GPIO0)
-        pins.gpio0.into_mode::<gpio::FunctionUart>(),
+        pins.gpio0.into_function::<gpio::FunctionUart>(),
         // UART RX (characters received by RP2040) on pin 2 (GPIO1)
-        pins.gpio1.into_mode::<gpio::FunctionUart>(),
+        pins.gpio1.into_function::<gpio::FunctionUart>(),
     );
     let uart = bsp::hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
         .enable(
@@ -311,8 +319,8 @@ fn main() -> ! {
         )
         .unwrap();
 
-    let sda_pin = pins.gpio14.into_mode::<bsp::hal::gpio::FunctionI2C>();
-    let scl_pin = pins.gpio15.into_mode::<bsp::hal::gpio::FunctionI2C>();
+    let sda_pin = pins.gpio14.into_function::<bsp::hal::gpio::FunctionI2C>();
+    let scl_pin = pins.gpio15.into_function::<bsp::hal::gpio::FunctionI2C>();
 
     let i2c = bsp::hal::I2C::i2c1(
         pac.I2C1,
@@ -348,7 +356,7 @@ fn main() -> ! {
     let idle_led = pins.gpio16.into_push_pull_output();
     let recording_led = pins.gpio17.into_push_pull_output();
 
-    let mut timer = bsp::hal::timer::Timer::new(pac.TIMER, &mut pac.RESETS);
+    let mut timer = bsp::hal::timer::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
     // Set up the GPIO pin that will be our input
     let in_pin = pins.gpio18.into_pull_down_input();
@@ -392,19 +400,22 @@ fn main() -> ! {
     }
 
     unsafe {
-        pac::NVIC::unmask(bsp::hal::pac::Interrupt::USBCTRL_IRQ);
+        // Interrupt for USBCTRL disables for unknown reason IO_IRQ_BANK0 and buttons,
+        // thefore polling will be in global loop.
+        // pac::NVIC::unmask(bsp::hal::pac::Interrupt::USBCTRL_IRQ);
         pac::NVIC::unmask(bsp::hal::pac::Interrupt::IO_IRQ_BANK0);
         pac::NVIC::unmask(bsp::hal::pac::Interrupt::TIMER_IRQ_0);
     };
 
     // These are implicitly used by the spi driver if they are in the correct mode
-    let _spi_sclk = pins.gpio10.into_mode::<gpio::FunctionSpi>();
-    let _spi_mosi = pins.gpio11.into_mode::<gpio::FunctionSpi>();
-    let _spi_miso = pins.gpio12.into_mode::<gpio::FunctionSpi>();
+    let spi_sclk: gpio::Pin<_, gpio::FunctionSpi, gpio::PullNone> = pins.gpio10.reconfigure();
+    let spi_mosi: gpio::Pin<_, gpio::FunctionSpi, gpio::PullNone> = pins.gpio11.reconfigure();
+    let spi_miso: gpio::Pin<_, gpio::FunctionSpi, gpio::PullUp> = pins.gpio12.reconfigure();
+
     let spi_cs = pins.gpio13.into_push_pull_output();
 
     // Create an SPI driver instance for the SPI1 device
-    let spi = bsp::hal::spi::Spi::<_, _, 8>::new(pac.SPI1);
+    let spi = bsp::hal::spi::Spi::<_, _, _, 8>::new(pac.SPI1, (spi_mosi, spi_miso, spi_sclk));
 
     // Exchange the uninitialised SPI driver for an initialised one
     let spi = spi.init(
@@ -414,11 +425,7 @@ fn main() -> ! {
         &embedded_hal::spi::MODE_0,
     );
 
-    let sdcard: SdCard<
-        bsp::hal::Spi<bsp::hal::spi::Enabled, pac::SPI1, 8>,
-        gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
-        IrqDelayer,
-    > = embedded_sdmmc::SdCard::new(spi, spi_cs, IrqDelayer {});
+    let sdcard = embedded_sdmmc::SdCard::new(spi, spi_cs, IrqDelayer {});
 
     let volume_mgr: VolumeManager<SdCardType, DummyTimesource> =
         embedded_sdmmc::VolumeManager::new(sdcard, DummyTimesource {});
@@ -448,7 +455,9 @@ fn main() -> ! {
     });
 
     loop {
-        asm::wfi();
+        unsafe {
+            handle_usbctrl();
+        }
     }
 }
 
@@ -491,12 +500,12 @@ unsafe fn handle_usbctrl() {
         vec.clear();
     });
 }
-#[allow(non_snake_case)]
-#[interrupt]
-unsafe fn USBCTRL_IRQ() {
-    handle_button();
-    handle_usbctrl();
-}
+// #[allow(non_snake_case)]
+// #[interrupt]
+// unsafe fn USBCTRL_IRQ() {
+//     handle_button();
+//     handle_usbctrl();
+// }
 
 fn handle_timer() {
     critical_section::with(|cs| {
