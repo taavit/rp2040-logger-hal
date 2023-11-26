@@ -6,7 +6,6 @@
 
 mod sensor;
 
-use arrayvec::{ArrayString, ArrayVec};
 use bsp::hal::timer::Alarm;
 use bsp::hal::uart::UartPeripheral;
 use bsp::hal::Timer;
@@ -14,6 +13,7 @@ use cortex_m::asm;
 use cortex_m::delay::Delay;
 use critical_section::Mutex;
 use embedded_sdmmc::{Directory, File, SdCard, TimeSource, Timestamp, Volume, VolumeManager};
+use heapless::{String, Vec};
 use sensor::lsm303d::LSM303D;
 use sensor::lsm303d::{configuration::*, Measurements};
 
@@ -27,11 +27,12 @@ use bsp::{
         uart::{DataBits, StopBits, UartConfig},
     },
 };
-use usb_device::class_prelude::{UsbBusAllocator, UsbClass};
+use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::{UsbDevice, UsbDeviceBuilder, UsbVidPid};
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 use core::panic::PanicInfo;
+use core::str::FromStr;
 use core::{cell::RefCell, fmt::Write};
 use embedded_hal::digital::v2::OutputPin;
 use fugit::{MicrosDurationU32, MicrosDurationU64, RateExtU32};
@@ -111,20 +112,22 @@ struct SdWriter {
     volume: Volume,
     root_dir: Option<Directory>,
     file_idx: u16,
-    base_filename: ArrayString<16>,
-    filename: ArrayString<32>,
+    base_filename: String<16>,
+    filename: String<32>,
 }
 
 impl SdWriter {
     pub fn new(file: &str, mut volume_mgr: VolumeManagerType) -> Self {
-        let volume = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
-        let filename = ArrayString::new();
+        let volume = volume_mgr
+            .open_volume(embedded_sdmmc::VolumeIdx(0))
+            .unwrap();
+        let filename = String::new();
         Self {
             volume,
             volume_mgr,
             file: None,
             file_idx: 1,
-            base_filename: ArrayString::from(file).unwrap(),
+            base_filename: String::from_str(file).unwrap(),
             filename,
             root_dir: None,
         }
@@ -133,14 +136,15 @@ impl SdWriter {
         critical_section::with(|cs| {
             if let Some(ref mut file) = self.file {
                 let mut cache = CACHE.borrow(cs).borrow_mut();
-                cache.push(ArrayString::from(data).unwrap());
+                cache.push(String::from_str(data).unwrap()).unwrap();
                 if cache.is_full() {
-                    let mut full_string = ArrayString::<640>::new();
-                    for e in cache.drain(..) {
-                        full_string.push_str(e.as_str());
+                    let mut full_string = String::<640>::new();
+                    for e in cache.iter() {
+                        full_string.push_str(e.as_str()).unwrap();
                     }
+                    cache.clear();
                     self.volume_mgr
-                        .write(&mut self.volume, file, full_string.as_bytes())
+                        .write(*file, full_string.as_bytes())
                         .unwrap();
                 }
             }
@@ -153,14 +157,13 @@ impl SdWriter {
         critical_section::with(|cs| {
             CACHE.borrow(cs).borrow_mut().clear();
             if let Some(dir) = self.root_dir.take() {
-                self.volume_mgr.close_dir(&self.volume, dir);
+                self.volume_mgr.close_dir(dir).unwrap();
             }
-            let root_dir = self.volume_mgr.open_root_dir(&mut self.volume).unwrap();
+            let root_dir = self.volume_mgr.open_root_dir(self.volume).unwrap();
             let csv_file = self
                 .volume_mgr
                 .open_file_in_dir(
-                    &mut self.volume,
-                    &root_dir,
+                    root_dir,
                     self.filename.as_str(),
                     embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
                 )
@@ -172,21 +175,20 @@ impl SdWriter {
 
     pub fn stop_recording(&mut self) {
         critical_section::with(|cs| {
-            if let Some(mut file) = self.file.take() {
+            if let Some(file) = self.file.take() {
                 let mut cache = CACHE.borrow(cs).borrow_mut();
 
-                let mut full_string = ArrayString::<640>::new();
-                for e in cache.drain(..) {
-                    full_string.push_str(e.as_str());
+                let mut full_string = String::<640>::new();
+                for e in cache.iter() {
+                    full_string.push_str(e.as_str()).unwrap();
                 }
-                self.volume_mgr
-                    .write(&mut self.volume, &mut file, full_string.as_bytes())
-                    .unwrap();
-                self.volume_mgr.close_file(&self.volume, file).unwrap();
+                cache.clear();
+                self.volume_mgr.write(file, full_string.as_bytes()).unwrap();
+                self.volume_mgr.close_file(file).unwrap();
             };
             let root_dir = self.root_dir.take();
             if let Some(root_dir) = root_dir {
-                self.volume_mgr.close_dir(&self.volume, root_dir);
+                self.volume_mgr.close_dir(root_dir).unwrap();
             }
             self.file_idx += 1;
         })
@@ -253,11 +255,9 @@ static SENSOR: Mutex<RefCell<Option<LSM303D<I2CPin>>>> = Mutex::new(RefCell::new
 static SDWRITER: Mutex<RefCell<Option<SdWriter>>> = Mutex::new(RefCell::new(None));
 static DELAYER: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
 static LED_SET: Mutex<RefCell<Option<LedSet>>> = Mutex::new(RefCell::new(None));
-static CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 10>>> =
-    Mutex::new(RefCell::new(ArrayVec::new_const()));
+static CACHE: Mutex<RefCell<Vec<String<64>, 10>>> = Mutex::new(RefCell::new(Vec::new()));
 
-static USB_CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 100>>> =
-    Mutex::new(RefCell::new(ArrayVec::new_const()));
+static USB_CACHE: Mutex<RefCell<Vec<String<64>, 100>>> = Mutex::new(RefCell::new(Vec::new()));
 
 /// The USB Device Driver (shared with the interrupt).
 static mut USB_DEVICE: Option<UsbDevice<bsp::hal::usb::UsbBus>> = None;
@@ -453,7 +453,7 @@ fn main() -> ! {
 }
 
 fn format_measurements<const SIZE: usize>(
-    mut message: &mut ArrayString<SIZE>,
+    mut message: &mut String<SIZE>,
     measurements: &Measurements,
     elapsed: MicrosDurationU64,
 ) {
@@ -480,14 +480,15 @@ unsafe fn handle_usbctrl() {
     }
     critical_section::with(|cs| {
         let mut vec = USB_CACHE.borrow_ref_mut(cs);
-        for row in vec.drain(..) {
+        for row in vec.iter() {
             let e = usb_serial.write(row.as_bytes());
             if e.is_err() {
-                let mut buf = ArrayString::<128>::new();
+                let mut buf = String::<128>::new();
                 let _ = write!(buf, "Problem with writing: {}\r\n", &row[..16]);
                 uart_write(buf.as_str());
             }
         }
+        vec.clear();
     });
 }
 #[allow(non_snake_case)]
@@ -508,7 +509,7 @@ fn handle_timer() {
             .read_measurements()
             .unwrap();
         let begin = Instant::from_ticks(0);
-        let mut buffer = ArrayString::<64>::new();
+        let mut buffer = String::<64>::new();
         let measure_time = Instant::from_ticks(critical_section::with(|cs| {
             TIMER
                 .borrow_ref(cs)
@@ -526,9 +527,9 @@ fn handle_timer() {
         uart_write(buffer.as_str());
         let mut cache = USB_CACHE.borrow_ref_mut(cs);
         if cache.is_full() {
-            cache.pop_at(0);
+            cache.remove(0);
         }
-        cache.push(buffer);
+        cache.push(buffer.clone()).unwrap();
         drop(cache);
         let mut leds = LED_SET.borrow_ref_mut(cs);
         let leds = leds.as_mut().unwrap();
@@ -630,7 +631,7 @@ fn uart_write(a: &str) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut a = ArrayString::<4096>::new();
+    let mut a = String::<4096>::new();
     writeln!(a, "{}", info).ok();
     uart_write(a.as_str());
 
