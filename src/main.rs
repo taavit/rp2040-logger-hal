@@ -4,16 +4,17 @@
 #![no_std]
 #![no_main]
 
+mod sd_writer;
 mod sensor;
 
-use arrayvec::{ArrayString, ArrayVec};
+use bsp::hal::gpio::{Pin, PullNone, PullUp};
 use bsp::hal::timer::Alarm;
 use bsp::hal::uart::UartPeripheral;
 use bsp::hal::Timer;
-use cortex_m::asm;
-use cortex_m::delay::Delay;
 use critical_section::Mutex;
-use embedded_sdmmc::{Directory, File, SdCard, TimeSource, Timestamp, Volume, VolumeManager};
+use embedded_sdmmc::{SdCard, VolumeManager};
+use heapless::{String, Vec};
+use sd_writer::{DummyTimesource, SdWriter};
 use sensor::lsm303d::LSM303D;
 use sensor::lsm303d::{configuration::*, Measurements};
 
@@ -27,6 +28,9 @@ use bsp::{
         uart::{DataBits, StopBits, UartConfig},
     },
 };
+use usb_device::class_prelude::UsbBusAllocator;
+use usb_device::prelude::{UsbDeviceBuilder, UsbVidPid};
+use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
 use core::panic::PanicInfo;
 use core::{cell::RefCell, fmt::Write};
@@ -41,8 +45,6 @@ use bsp::hal::{
     sio::Sio,
     watchdog::Watchdog,
 };
-use embedded_hal::blocking::delay::DelayMs;
-use embedded_hal::blocking::delay::DelayUs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -67,170 +69,41 @@ impl State {
     }
 }
 
-struct IrqDelayer {}
-
-impl DelayUs<u8> for IrqDelayer {
-    fn delay_us(&mut self, us: u8) {
-        critical_section::with(|cs| {
-            DELAYER
-                .borrow(cs)
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .delay_us(us as u32);
-        })
-    }
-}
-
-impl DelayMs<u32> for IrqDelayer {
-    fn delay_ms(&mut self, ms: u32) {
-        critical_section::with(|cs| {
-            DELAYER
-                .borrow(cs)
-                .borrow_mut()
-                .as_mut()
-                .unwrap()
-                .delay_ms(ms);
-        });
-    }
-}
-
 type SdCardType = SdCard<
-    bsp::hal::Spi<bsp::hal::spi::Enabled, pac::SPI1, 8>,
-    gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
-    IrqDelayer,
+    bsp::hal::Spi<
+        bsp::hal::spi::Enabled,
+        pac::SPI1,
+        (
+            Pin<gpio::bank0::Gpio11, gpio::FunctionSpi, PullNone>,
+            Pin<gpio::bank0::Gpio12, gpio::FunctionSpi, PullUp>,
+            Pin<gpio::bank0::Gpio10, gpio::FunctionSpi, PullNone>,
+        ),
+    >,
+    Pin<gpio::bank0::Gpio13, gpio::FunctionSio<gpio::SioOutput>, PullDown>,
+    Timer,
 >;
 
-type VolumeManagerType = VolumeManager<SdCardType, DummyTimesource>;
-struct SdWriter {
-    file: Option<File>,
-    volume_mgr: VolumeManagerType,
-    volume: Volume,
-    root_dir: Directory,
-    file_idx: u16,
-    base_filename: ArrayString<16>,
-    filename: ArrayString<32>,
-}
-
-impl SdWriter {
-    pub fn new(file: &str, mut volume_mgr: VolumeManagerType) -> Self {
-        let volume = volume_mgr.get_volume(embedded_sdmmc::VolumeIdx(0)).unwrap();
-        let root_dir = volume_mgr.open_root_dir(&volume).unwrap();
-        let filename = ArrayString::new();
-        Self {
-            volume,
-            volume_mgr,
-            file: None,
-            file_idx: 1,
-            base_filename: ArrayString::from(file).unwrap(),
-            filename,
-            root_dir,
-        }
-    }
-    pub fn write(&mut self, data: &str) {
-        critical_section::with(|cs| {
-            if let Some(ref mut file) = self.file {
-                let mut cache = CACHE.borrow(cs).borrow_mut();
-                cache.push(ArrayString::from(data).unwrap());
-                if cache.is_full() {
-                    let mut full_string = ArrayString::<640>::new();
-                    for e in cache.drain(..) {
-                        full_string.push_str(e.as_str());
-                    }
-                    self.volume_mgr
-                        .write(&mut self.volume, file, full_string.as_bytes())
-                        .unwrap();
-                }
-            }
-        });
-    }
-
-    pub fn start_recording(&mut self) {
-        self.generate_filename();
-
-        critical_section::with(|cs| {
-            CACHE.borrow(cs).borrow_mut().clear();
-            let csv_file = self
-                .volume_mgr
-                .open_file_in_dir(
-                    &mut self.volume,
-                    &self.root_dir,
-                    self.filename.as_str(),
-                    embedded_sdmmc::Mode::ReadWriteCreateOrTruncate,
-                )
-                .unwrap();
-            self.file = Some(csv_file);
-        });
-    }
-
-    pub fn stop_recording(&mut self) {
-        critical_section::with(|cs| {
-            if let Some(mut file) = self.file.take() {
-                let mut cache = CACHE.borrow(cs).borrow_mut();
-
-                let mut full_string = ArrayString::<640>::new();
-                for e in cache.drain(..) {
-                    full_string.push_str(e.as_str());
-                }
-                self.volume_mgr
-                    .write(&mut self.volume, &mut file, full_string.as_bytes())
-                    .unwrap();
-                self.volume_mgr.close_file(&self.volume, file).unwrap();
-            };
-            self.file_idx += 1;
-        })
-    }
-
-    fn generate_filename(&mut self) {
-        self.filename.clear();
-        write!(
-            self.filename,
-            "{}_{:05}.csv",
-            self.base_filename, self.file_idx
-        )
-        .unwrap();
-    }
-}
-
-#[derive(Default)]
-pub struct DummyTimesource();
-
-impl TimeSource for DummyTimesource {
-    // In theory you could use the RTC of the rp2040 here, if you had
-    // any external time synchronizing device.
-    fn get_timestamp(&self) -> Timestamp {
-        Timestamp {
-            year_since_1970: 0,
-            zero_indexed_month: 0,
-            zero_indexed_day: 0,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
-        }
-    }
-}
-
-type ButtonPin = gpio::Pin<gpio::bank0::Gpio18, gpio::Input<PullDown>>;
-type ControlLed = gpio::Pin<gpio::bank0::Gpio25, gpio::Output<gpio::PushPull>>;
-type IdleLed = gpio::Pin<gpio::bank0::Gpio16, gpio::Output<gpio::PushPull>>;
-type RecordingLed = gpio::Pin<gpio::bank0::Gpio17, gpio::Output<gpio::PushPull>>;
+type ButtonPin = Pin<gpio::bank0::Gpio18, gpio::FunctionSio<gpio::SioInput>, PullDown>;
+type ControlLed = Pin<gpio::bank0::Gpio25, gpio::FunctionSio<gpio::SioOutput>, PullDown>;
+type IdleLed = Pin<gpio::bank0::Gpio16, gpio::FunctionSio<gpio::SioOutput>, PullDown>;
+type RecordingLed = Pin<gpio::bank0::Gpio17, gpio::FunctionSio<gpio::SioOutput>, PullDown>;
 
 type LedSet = (ControlLed, IdleLed, RecordingLed, RefCell<bool>);
 
 type I2CPin = bsp::hal::i2c::I2C<
     bsp::pac::I2C1,
     (
-        gpio::Pin<gpio::bank0::Gpio14, gpio::FunctionI2C>,
-        gpio::Pin<gpio::bank0::Gpio15, gpio::FunctionI2C>,
+        Pin<gpio::bank0::Gpio14, gpio::FunctionI2C, PullDown>,
+        Pin<gpio::bank0::Gpio15, gpio::FunctionI2C, PullDown>,
     ),
 >;
 
 type UartLogger = UartPeripheral<
     bsp::hal::uart::Enabled,
-    bsp::pac::UART0,
+    pac::UART0,
     (
-        gpio::Pin<gpio::bank0::Gpio0, gpio::Function<gpio::Uart>>,
-        gpio::Pin<gpio::bank0::Gpio1, gpio::Function<gpio::Uart>>,
+        Pin<gpio::bank0::Gpio0, gpio::FunctionUart, PullDown>,
+        Pin<gpio::bank0::Gpio1, gpio::FunctionUart, PullDown>,
     ),
 >;
 static GLOBAL_PINS: Mutex<RefCell<Option<ButtonPin>>> = Mutex::new(RefCell::new(None));
@@ -240,15 +113,14 @@ static DEV_ALARM: Mutex<RefCell<Option<bsp::hal::timer::Alarm0>>> = Mutex::new(R
 static UART: Mutex<RefCell<Option<UartLogger>>> = Mutex::new(RefCell::new(None));
 static SENSOR: Mutex<RefCell<Option<LSM303D<I2CPin>>>> = Mutex::new(RefCell::new(None));
 static SDWRITER: Mutex<RefCell<Option<SdWriter>>> = Mutex::new(RefCell::new(None));
-static DELAYER: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
 static LED_SET: Mutex<RefCell<Option<LedSet>>> = Mutex::new(RefCell::new(None));
-static CACHE: Mutex<RefCell<ArrayVec<ArrayString<64>, 10>>> =
-    Mutex::new(RefCell::new(ArrayVec::new_const()));
+static CACHE: Mutex<RefCell<Vec<String<64>, 10>>> = Mutex::new(RefCell::new(Vec::new()));
+
+static USB_CACHE: Mutex<RefCell<Vec<String<64>, 100>>> = Mutex::new(RefCell::new(Vec::new()));
 
 #[entry]
 fn main() -> ! {
     let mut pac = pac::Peripherals::take().unwrap();
-    let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let sio = Sio::new(pac.SIO);
 
@@ -266,8 +138,8 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
-
+    // let delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let mut delay = rp2040_hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
     let pins = bsp::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
@@ -277,9 +149,9 @@ fn main() -> ! {
 
     let uart_pins = (
         // UART TX (characters sent from RP2040) on pin 1 (GPIO0)
-        pins.gpio0.into_mode::<gpio::FunctionUart>(),
+        pins.gpio0.into_function::<gpio::FunctionUart>(),
         // UART RX (characters received by RP2040) on pin 2 (GPIO1)
-        pins.gpio1.into_mode::<gpio::FunctionUart>(),
+        pins.gpio1.into_function::<gpio::FunctionUart>(),
     );
     let uart = bsp::hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
         .enable(
@@ -288,8 +160,8 @@ fn main() -> ! {
         )
         .unwrap();
 
-    let sda_pin = pins.gpio14.into_mode::<bsp::hal::gpio::FunctionI2C>();
-    let scl_pin = pins.gpio15.into_mode::<bsp::hal::gpio::FunctionI2C>();
+    let sda_pin = pins.gpio14.into_function::<bsp::hal::gpio::FunctionI2C>();
+    let scl_pin = pins.gpio15.into_function::<bsp::hal::gpio::FunctionI2C>();
 
     let i2c = bsp::hal::I2C::i2c1(
         pac.I2C1,
@@ -325,8 +197,6 @@ fn main() -> ! {
     let idle_led = pins.gpio16.into_push_pull_output();
     let recording_led = pins.gpio17.into_push_pull_output();
 
-    let mut timer = bsp::hal::timer::Timer::new(pac.TIMER, &mut pac.RESETS);
-
     // Set up the GPIO pin that will be our input
     let in_pin = pins.gpio18.into_pull_down_input();
 
@@ -335,46 +205,65 @@ fn main() -> ! {
     in_pin.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
     in_pin.set_interrupt_enabled(gpio::Interrupt::EdgeLow, true);
 
+    // Init usb device
+    let force_vbus_detect_bit = true;
+
+    let usb_bus = bsp::hal::usb::UsbBus::new(
+        pac.USBCTRL_REGS,
+        pac.USBCTRL_DPRAM,
+        clocks.usb_clock,
+        force_vbus_detect_bit,
+        &mut pac.RESETS,
+    );
+
+    let bus_allocator = UsbBusAllocator::new(usb_bus);
+    let mut usb_serial = SerialPort::new(&bus_allocator);
+
+    let mut usb_dev = UsbDeviceBuilder::new(&bus_allocator, UsbVidPid(0x16c0, 0x27dd))
+        .product("AccMag tracker")
+        .device_class(USB_CLASS_CDC)
+        .build();
+
     unsafe {
+        // Interrupt for USBCTRL disables for unknown reason IO_IRQ_BANK0 and buttons,
+        // thefore polling will be in global loop.
+        // pac::NVIC::unmask(bsp::hal::pac::Interrupt::USBCTRL_IRQ);
         pac::NVIC::unmask(bsp::hal::pac::Interrupt::IO_IRQ_BANK0);
         pac::NVIC::unmask(bsp::hal::pac::Interrupt::TIMER_IRQ_0);
     };
+
     // These are implicitly used by the spi driver if they are in the correct mode
-    let _spi_sclk = pins.gpio10.into_mode::<gpio::FunctionSpi>();
-    let _spi_mosi = pins.gpio11.into_mode::<gpio::FunctionSpi>();
-    let _spi_miso = pins.gpio12.into_mode::<gpio::FunctionSpi>();
+    let spi_sclk: gpio::Pin<_, gpio::FunctionSpi, gpio::PullNone> = pins.gpio10.reconfigure();
+    let spi_mosi: gpio::Pin<_, gpio::FunctionSpi, gpio::PullNone> = pins.gpio11.reconfigure();
+    let spi_miso: gpio::Pin<_, gpio::FunctionSpi, gpio::PullUp> = pins.gpio12.reconfigure();
+
     let spi_cs = pins.gpio13.into_push_pull_output();
 
     // Create an SPI driver instance for the SPI1 device
-    let spi = bsp::hal::spi::Spi::<_, _, 8>::new(pac.SPI1);
+    let spi = bsp::hal::spi::Spi::<_, _, _, 8>::new(pac.SPI1, (spi_mosi, spi_miso, spi_sclk));
 
     // Exchange the uninitialised SPI driver for an initialised one
     let spi = spi.init(
         &mut pac.RESETS,
         clocks.peripheral_clock.freq(),
         400.kHz(), // card initialization happens at low baud rate
-        &embedded_hal::spi::MODE_0,
+        embedded_hal::spi::MODE_0,
     );
 
-    let sdcard: SdCard<
-        bsp::hal::Spi<bsp::hal::spi::Enabled, pac::SPI1, 8>,
-        gpio::Pin<gpio::bank0::Gpio13, gpio::Output<gpio::PushPull>>,
-        IrqDelayer,
-    > = embedded_sdmmc::SdCard::new(spi, spi_cs, IrqDelayer {});
+    let sdcard = embedded_sdmmc::SdCard::new(spi, spi_cs, delay);
 
     let volume_mgr: VolumeManager<SdCardType, DummyTimesource> =
         embedded_sdmmc::VolumeManager::new(sdcard, DummyTimesource {});
 
     critical_section::with(|cs| {
-        let mut alarm = timer.alarm_0().unwrap();
+        let mut alarm = delay.alarm_0().unwrap();
         let _ = alarm.schedule(MicrosDurationU32::Hz(10));
         alarm.enable_interrupt();
         DEV_ALARM.replace(cs, Some(alarm));
-        TIMER.replace(cs, Some(timer));
+        TIMER.replace(cs, Some(delay));
         GLOBAL_PINS.borrow(cs).replace(Some(in_pin));
         UART.borrow(cs).replace(Some(uart));
         SENSOR.borrow(cs).replace(Some(sensor));
-        DELAYER.borrow(cs).replace(Some(delay));
         LED_SET.borrow(cs).replace(Some((
             control_led,
             idle_led,
@@ -390,12 +279,25 @@ fn main() -> ! {
     });
 
     loop {
-        asm::wfi();
+        if usb_dev.poll(&mut [&mut usb_serial]) {
+            critical_section::with(|cs| {
+                let mut vec = USB_CACHE.borrow_ref_mut(cs);
+                for row in vec.iter() {
+                    let e = usb_serial.write(row.as_bytes());
+                    if e.is_err() {
+                        let mut buf = String::<128>::new();
+                        let _ = write!(buf, "Problem with writing: {}\r\n", &row[..16]);
+                        uart_write(buf.as_str());
+                    }
+                }
+                vec.clear();
+            });
+        }
     }
 }
 
 fn format_measurements<const SIZE: usize>(
-    mut message: &mut ArrayString<SIZE>,
+    mut message: &mut String<SIZE>,
     measurements: &Measurements,
     elapsed: MicrosDurationU64,
 ) {
@@ -414,8 +316,7 @@ fn format_measurements<const SIZE: usize>(
     .unwrap();
 }
 
-#[interrupt]
-fn TIMER_IRQ_0() {
+fn handle_timer() {
     critical_section::with(|cs| {
         let current_state: State = *LOGGER_STATE.borrow_ref(cs);
         let measurements = SENSOR
@@ -426,7 +327,7 @@ fn TIMER_IRQ_0() {
             .read_measurements()
             .unwrap();
         let begin = Instant::from_ticks(0);
-        let mut buffer = ArrayString::<64>::new();
+        let mut buffer = String::<64>::new();
         let measure_time = Instant::from_ticks(critical_section::with(|cs| {
             TIMER
                 .borrow_ref(cs)
@@ -441,12 +342,13 @@ fn TIMER_IRQ_0() {
                 .unwrap_or(MicrosDurationU64::from_ticks(0)),
         );
 
-        UART.borrow(cs)
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .write_str(&buffer)
-            .unwrap();
+        uart_write(buffer.as_str());
+        let mut cache = USB_CACHE.borrow_ref_mut(cs);
+        if cache.is_full() {
+            cache.remove(0);
+        }
+        cache.push(buffer.clone()).unwrap();
+        drop(cache);
         let mut leds = LED_SET.borrow_ref_mut(cs);
         let leds = leds.as_mut().unwrap();
         if current_state == State::Recording {
@@ -492,7 +394,11 @@ fn TIMER_IRQ_0() {
 }
 
 #[interrupt]
-fn IO_IRQ_BANK0() {
+fn TIMER_IRQ_0() {
+    handle_timer();
+}
+
+fn handle_button() {
     critical_section::with(|cs| {
         let mut pin = GLOBAL_PINS.borrow(cs).borrow_mut();
         let button = pin.as_mut();
@@ -525,6 +431,11 @@ fn IO_IRQ_BANK0() {
     });
 }
 
+#[interrupt]
+fn IO_IRQ_BANK0() {
+    handle_button();
+}
+
 fn uart_write(a: &str) {
     critical_section::with(|cs| {
         UART.borrow(cs)
@@ -538,7 +449,7 @@ fn uart_write(a: &str) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut a = ArrayString::<4096>::new();
+    let mut a = String::<4096>::new();
     writeln!(a, "{}", info).ok();
     uart_write(a.as_str());
 
