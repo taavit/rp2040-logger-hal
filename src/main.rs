@@ -412,15 +412,13 @@ fn handle_button() {
                 s.toggle();
                 if *s == State::Idle {
                     SDWRITER
-                        .borrow(cs)
-                        .borrow_mut()
+                        .borrow_ref_mut(cs)
                         .as_mut()
                         .unwrap()
                         .stop_recording();
                 } else {
                     SDWRITER
-                        .borrow(cs)
-                        .borrow_mut()
+                        .borrow_ref_mut(cs)
                         .as_mut()
                         .unwrap()
                         .start_recording();
